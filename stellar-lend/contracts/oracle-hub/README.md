@@ -35,6 +35,17 @@ reliable prices.
 - **Health monitoring.** Per-feed staleness classification, consecutive failure
   tracking, and a per-asset circuit breaker that auto-opens after 3 failures
   and self-heals on a successful read.
+- **Heartbeat monitoring.** Optional per-asset expectations for push sources
+  (`interval_seconds`, `stale_after_seconds`, `expiry_seconds`). A source that
+  goes quiet is classified `Fresh`/`Due`/`Stale`/`Expired` by a permissionless
+  sweep, and an expired one fails the asset closed instead of serving a price
+  nobody is updating. Pull feeds are exempt: they answer on demand.
+- **Price history.** Opt-in, bounded retention of resolved prices per asset, so
+  a consumer can audit what the hub published rather than only what it holds
+  right now. Off by default.
+- **Reporter incentives.** An optional governance-funded reward pool that pays
+  oracle addresses for accepted reports, with a per-oracle minimum interval and
+  a rate ceiling so the pool cannot be drained by a spinning feed.
 - **Upgrade mechanism.** Governance stages a WASM hash, then atomically swaps
   the live contract code via `update_current_contract_wasm`; instance storage
   and the version counter survive the swap.
@@ -43,7 +54,7 @@ reliable prices.
 ## Quick start
 
 ```bash
-cargo test -p oracle-hub          # 96 unit tests
+cargo test -p oracle-hub          # 158 unit tests
 cargo clippy -p oracle-hub --all-targets
 cargo fmt -p oracle-hub
 ```
@@ -147,6 +158,117 @@ invalidate_cache(asset)  // drop one entry
   invalidates all entries. `set_cache_ttl` alone does not, because a keeper
   enabling the cache should not throw away the entry it just wrote.
 
+## Heartbeat monitoring
+
+Off by default, because it is a promise the protocol has to keep. When enabled,
+governance declares how often a push source is expected to report:
+
+```text
+set_heartbeat_config(asset, config)  // asset = None sets the hub-wide default
+get_heartbeat_config(asset)
+get_heartbeats(asset)                // liveness of every registered slot
+get_heartbeat(asset, priority)       // liveness of one slot
+sweep_heartbeats(asset)              // permissionless, idempotent
+heartbeat_expiry(asset, priority)    // deadline for scheduling a keeper
+```
+
+```rust
+HeartbeatConfig {
+    enabled: bool,             // false leaves the asset unmonitored
+    interval_seconds: u64,     // expected reporting cadence
+    stale_after_seconds: u64,  // silence that marks a slot stale
+    expiry_seconds: u64,       // silence that expires the slot
+}
+```
+
+- A report — or a successful live pull — is a beat. A slot is `Fresh` inside its
+  interval, `Due` past it, `Stale` past `stale_after_seconds`, and `Expired` past
+  `expiry_seconds`; a slot that has never reported is `Silent` until its silence
+  is itself a failure. Enabling monitoring re-arms the clock, so a newly
+  monitored feed gets a full window to prove itself.
+- `Expired` is the point where the hub stops serving the asset: the price path
+  raises `HeartbeatExpired`, and `sweep_heartbeats` opens the same automatic
+  circuit breaker the health monitor uses, so recovery is the existing
+  breaker's cooldown followed by a successful read. A monitored feed therefore
+  has to report *within* `DEFAULT_BREAKER_COOLDOWN_SECONDS` (600 s) — set
+  `expiry_seconds` above it, and express urgency in `stale_after_seconds`.
+- `Stale` does not halt the asset. The existing staleness path already refuses
+  to price from a late source, so a stale slot is demoted rather than fatal, and
+  a healthy second source keeps serving.
+- **Pull feeds are exempt.** A pull source has no cadence to keep: only its last
+  successful pull is recorded, and its silence can never expire an asset.
+- Sweeping is permissionless and publishes only transitions, so a keeper can run
+  it every ledger without flooding the log with "still fine".
+
+## Price history
+
+`get_price` answers a question about *now*. History answers a question about
+*then*: which price did the hub publish for an asset at a point in time, and with
+how much agreement. It is off by default and bounded per asset:
+
+```text
+set_history_limit(asset, max_entries)  // asset = None sets the hub-wide default
+get_history_config(asset)              // limit and how much of it is used
+get_price_history(asset)               // retained entries, oldest first
+get_price_history_range(asset, from, to)
+clear_price_history(asset)
+```
+
+- Entries are written on a **fresh resolution only** — a cache hit records
+  nothing, so the audit trail is the sequence of prices the hub published, not
+  one row per consumer that read them.
+- Each entry keeps the price and timestamp, the aggregate confidence, how many
+  feeds participated, how many were active, the strategy, whether a fallback was
+  used, and the deviation inside the accepted set. The inputs that produced a
+  decision, not just its output.
+- Identical observations in the same ledger second collapse into one entry: one
+  second is one fact about a market, however many readers asked for it.
+- Storage is a fixed 100-slot ring, so changing retention never reinterprets what
+  is already on chain. Lowering a limit prunes what no longer fits; `0` disables
+  history for the scope and drops what it holds.
+
+## Reporter incentives
+
+An oracle address is a volunteer. Governance can register five per asset but
+cannot make any of them stay online. The hub can already detect a silent source
+(heartbeats); the reward pool is what keeps it reporting:
+
+```text
+set_reward_token(token)                    // once: outstanding rewards are in it
+set_incentives_enabled(enabled)
+set_reward_per_report(asset, reward)       // token base units
+set_reward_min_interval(seconds)           // anti-spin guard
+get_incentive_config(asset)
+fund_rewards(amount)                       // governance tops the pool up
+claim_rewards(oracle)                      // reporter authorizes its own claim
+withdraw_rewards(to, amount)               // governance recovers unspent funds
+get_rewards(oracle)
+```
+
+```rust
+IncentiveConfig {
+    enabled: bool,
+    reward_per_report: i128,    // per accepted report, in token base units
+    min_interval_seconds: u64,  // spacing between rewarded reports
+}
+```
+
+- An **accepted** report earns the reward — a rejected or unauthorized one earns
+  nothing, and a pull feed earns nothing at all, because it is queried rather
+  than reporting.
+- Two rules keep the pool safe: a report only earns once
+  `min_interval_seconds` have passed since that oracle's last rewarded report
+  for the asset, and a rate above `MAX_REWARD_PER_REPORT` is refused.
+- The token balance *is* the pool, so funding and payouts need no mirrored
+  accounting. Earning therefore creates a liability: a claim reverts with
+  `RewardPoolShortfall` when the pool has not been funded yet, and
+  `withdraw_rewards` refuses to take the pool below what reporters have earned.
+  `get_rewards` exposes a reporter's balance alongside `total_owed` and the pool
+  balance, so a keeper can fund before a claim fails.
+- Claims require the reporter's own authorization, the balance is zeroed before
+  the payout, and the reward token is set only once — a token that swapped
+  under an outstanding accrual would quietly redefine what was owed.
+
 ## Health monitoring loop
 
 An off-chain watcher calls `monitor_oracle_health(asset)` after each observed
@@ -170,6 +292,9 @@ The suite lives in `src/tests/`:
 | `gas_test` | cached read cheaper than a recompute, bounded cost per extra source |
 | `provider_test` | pull aggregation, mixed push/pull, provider views, invalid price rejection |
 | `health_test` | feed classification, breaker trip/cooldown/self-heal, success reset |
+| `heartbeat_test` | cadence classification, arming, expiry fail-closed, breaker interaction, recovery, pull exemption, config governance, sweep idempotence |
+| `history_test` | opt-in recording, fresh-resolution-only audit trail, same-second collapse, ordering, ring wrap, range queries, retention changes, governance |
+| `incentives_test` | accepted-only accrual, per-asset rates, anti-spin interval, claim auth, pool shortfall, withdrawal limits, freeze interaction |
 | `freeze_test` | global and per-asset freeze/thaw, precedence, auth |
 | `upgrade_test` | staging, pending visibility, frozen/unauthorized gating, invalid-wasm rejection |
 

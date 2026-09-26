@@ -56,7 +56,7 @@ impl IsolatedMarket {
         {
             return Err("Liquidation threshold must be >= collateral factor and <= 100%");
         }
-        if liquidation_bonus_bps < 0 || liquidation_bonus_bps > 2_000 {
+        if !(0..=2_000).contains(&liquidation_bonus_bps) {
             return Err("Liquidation bonus must be between 0% and 20%");
         }
 

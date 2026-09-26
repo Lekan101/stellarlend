@@ -9,6 +9,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [Unreleased]
 
 ### Added
+- Heartbeat monitoring in the Oracle Hub: opt-in per-asset reporting-cadence expectations (`interval_seconds`, `stale_after_seconds`, `expiry_seconds`), a permissionless idempotent sweep, and a fail-closed expiry that withholds a price nobody is updating instead of serving a stale one (#1034)
+- Bounded price-history retention in the Oracle Hub: an opt-in fixed ring of resolved prices per asset, recorded on fresh resolutions only, queryable by range and recorded with the inputs that produced each decision (#1041)
+- Governance-funded reporter incentives in the Oracle Hub: a token reward pool that pays oracle addresses for accepted reports, with per-asset rates, a per-oracle minimum interval, a rate ceiling, reporter-authorized claims, and a withdrawal floor that cannot touch earnings already owed (#1042)
+- Market-wide emergency pause in the lending contract, with a guardian/admin-controlled lifecycle, operation-specific gates, and a reversible pause state that survives protocol calls already in flight (#1031)
 - Opt-in TTL price cache in the Oracle Hub with freshness clamping, epoch invalidation on governance changes, and read-cost regression tests (#1037)
 - Per-asset aggregation parameters (deviation band, source floor) and an explicit switch to disable the deviation check in the Oracle Hub (#1035)
 - Per-asset feed index so the price read cost stays proportional to the sources actually registered (#1037)
@@ -47,6 +51,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Added contributing documentation
 
 ### Fixed
+- Repaid, withdrawn, and liquidated positions stay open while a market is paused, so the pause stops new risk instead of trapping users in it (#1031)
+- Range-check overflow lint in the isolated-market validation path
 - Borrow interest overflow error
 - Integration test placeholders and inconsistencies
 - Default debt asset initialization for borrow/repay

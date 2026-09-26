@@ -1,15 +1,22 @@
 #![cfg(test)]
 
+extern crate alloc;
+
+use alloc::string::ToString as _;
+
 use crate::account::{CollateralAssetConfig, MarginAccount, MarginCallLevel, MarginMode};
 use crate::cross::{
     borrow_cross_margin, calculate_multi_collateral_summary, deposit_cross_collateral,
     liquidate_cross_margin_multi_collateral, withdraw_cross_collateral,
 };
+use crate::emergency::{EmergencyOp, EmergencyState, MarketRegistry, OpPause, PriceContext};
 use crate::isolated::{
     borrow_isolated_market, deposit_isolated_market, liquidate_isolated_market_position,
     repay_isolated_market, withdraw_isolated_market, IsolatedMarket, IsolatedUserPosition,
 };
-use soroban_sdk::{testutils::Address as _, Address, Env, Map, Vec};
+use soroban_sdk::testutils::{Address as _, ContractFunctionSet, Events as _};
+use soroban_sdk::xdr::{ContractEventBody, ScVal};
+use soroban_sdk::{Address, Env, Map, TryFromVal, Val, Vec};
 
 #[test]
 fn test_multi_collateral_cross_margin_summary_and_borrowing() {
@@ -353,4 +360,794 @@ fn test_isolated_market_bad_debt_containment() {
     // Remaining debt was wiped from position and isolated in the market pool.
     assert_eq!(market.bad_debt_contained, 409_090_910);
     assert_eq!(position.debt_amount, 0);
+}
+
+// -------------------------------------------------------------------------
+// Protocol-wide emergency pause
+// -------------------------------------------------------------------------
+
+/// $1.00 with 7 decimals, the price scale the isolated-market math expects.
+const UNIT_PRICE: i128 = 10_000_000;
+/// 7 decimals.
+const DECIMALS: u32 = 7;
+
+/// Both assets priced at $1.00 with 7 decimals.
+fn prices() -> PriceContext {
+    PriceContext::symmetric(UNIT_PRICE, DECIMALS)
+}
+
+/// Build an isolated market with a 60 % LTV, 70 % liquidation threshold, and a
+/// 5 % liquidator bonus.
+fn test_market(env: &Env, collateral: &Address, borrow_asset: &Address) -> IsolatedMarket {
+    IsolatedMarket::new(
+        Address::generate(env),
+        collateral.clone(),
+        borrow_asset.clone(),
+        1_000_000 * UNIT_PRICE,
+        6000,
+        7000,
+        500,
+    )
+    .expect("valid market parameters")
+}
+
+/// Registry with `count` running markets, plus the admin, guardian, and a
+/// stranger that should never be able to move the pause.
+struct PauseFixture {
+    env: Env,
+    admin: Address,
+    guardian: Address,
+    stranger: Address,
+    collateral: Address,
+    usdc: Address,
+    markets: Vec<Address>,
+    registry: MarketRegistry,
+}
+
+fn pause_fixture(count: u32) -> PauseFixture {
+    pause_fixture_with(Env::default(), count)
+}
+
+fn pause_fixture_with(env: Env, count: u32) -> PauseFixture {
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let collateral = Address::generate(&env);
+    let usdc = Address::generate(&env);
+
+    let mut registry = MarketRegistry::new(&env, admin.clone(), Some(guardian.clone()));
+    let mut markets: Vec<Address> = Vec::new(&env);
+    for _ in 0..count {
+        let market = test_market(&env, &collateral, &usdc);
+        let id = market.market_id.clone();
+        registry.open_market(0, market).expect("market registered");
+        markets.push_back(id);
+    }
+
+    PauseFixture {
+        env,
+        admin,
+        guardian,
+        stranger,
+        collateral,
+        usdc,
+        markets,
+        registry,
+    }
+}
+
+impl PauseFixture {
+    /// A fresh position in market `i`.
+    fn position(&self, i: u32) -> IsolatedUserPosition {
+        IsolatedUserPosition {
+            owner: Address::generate(&self.env),
+            market_id: self.markets.get(i).unwrap(),
+            collateral_amount: 0,
+            debt_amount: 0,
+        }
+    }
+
+    /// Fund market `i` with collateral and open a debt position, so the
+    /// position is both solvent and liquidatable-capable.
+    fn fund(&mut self, i: u32, collateral: i128, debt: i128) -> IsolatedUserPosition {
+        let market_id = self.markets.get(i).unwrap();
+        let mut position = self.position(i);
+        self.registry
+            .deposit(0, &market_id, &mut position, &self.collateral, collateral)
+            .expect("deposit accepted");
+        self.registry
+            .borrow(0, &market_id, &mut position, &self.usdc, debt, &prices())
+            .expect("borrow accepted");
+        position
+    }
+}
+
+/// Stand-in for a host contract, so events published by the pause engine are
+/// recorded against a contract id the way they are in production.
+struct HostContract;
+
+impl ContractFunctionSet for HostContract {
+    fn call(&self, _func: &str, _env: Env, _args: &[Val]) -> Option<Val> {
+        None
+    }
+}
+
+#[test]
+fn test_incident_lifecycle_is_published_as_contract_events() {
+    let env = Env::default();
+    // Events only carry a contract id when published from inside a contract
+    // frame, which is how a host contract would call this library.
+    let contract = env.register(HostContract, ());
+
+    env.as_contract(&contract, || {
+        let mut f = pause_fixture_with(env.clone(), 2);
+        f.registry
+            .halt_all(&env, &f.guardian, 1_000, "oracle depeg")
+            .expect("halt");
+        f.registry.begin_recovery(&env, &f.admin).expect("recovery");
+        f.registry
+            .set_op_pause(&env, &f.admin, EmergencyOp::Borrow, true, 2_000, 600)
+            .expect("kill switch");
+        f.registry.resume_all(&env, &f.admin).expect("resume");
+    });
+
+    // An indexer must be able to reconstruct the incident from the event log
+    // alone, including how many markets the cascade took down.
+    let events = env.events().all();
+    let mut lifecycle_events: alloc::vec::Vec<ContractEventBody> = alloc::vec::Vec::new();
+    let mut saw_op_pause = false;
+    for event in events.events().iter() {
+        let ContractEventBody::V0(body) = &event.body;
+        match body.topics.first() {
+            Some(ScVal::Symbol(sym)) if sym.to_string() == "emergency" => {
+                lifecycle_events.push(event.body.clone())
+            }
+            Some(ScVal::Symbol(sym)) if sym.to_string() == "op_pause" => saw_op_pause = true,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        lifecycle_events.len(),
+        3,
+        "halt, recovery, and resume are all logged"
+    );
+    assert!(saw_op_pause, "switch changes are logged too");
+
+    // Event data is (from, to, caller, markets_suspended, at) for the halt.
+    let ContractEventBody::V0(halt) = lifecycle_events.first().expect("halt event");
+    let data: Vec<Val> = Vec::try_from_val(&env, &halt.data).expect("event data");
+    assert_eq!(
+        EmergencyState::try_from_val(&env, &data.get(1).expect("to")).expect("to state"),
+        EmergencyState::Halted
+    );
+    assert_eq!(
+        u32::try_from_val(&env, &data.get(3).expect("suspended")).expect("suspended count"),
+        2
+    );
+    assert_eq!(
+        u64::try_from_val(&env, &data.get(4).expect("at")).expect("at"),
+        1_000
+    );
+}
+
+#[test]
+fn test_emergency_halt_cascades_to_every_market() {
+    let mut f = pause_fixture(3);
+    assert_eq!(f.registry.market_count(), 3);
+    assert_eq!(f.registry.halted_market_count(), 0);
+
+    let transition = f
+        .registry
+        .halt_all(&f.env, &f.admin, 1_000, "oracle depeg")
+        .expect("admin may halt");
+    assert_eq!(transition.from, EmergencyState::Normal);
+    assert_eq!(transition.to, EmergencyState::Halted);
+    assert_eq!(transition.at, 1_000);
+    assert_eq!(f.registry.state(), EmergencyState::Halted);
+
+    // Every market is halted, not just the first.
+    assert_eq!(f.registry.halted_market_count(), 3);
+    for i in 0..3 {
+        let id = f.markets.get(i).unwrap();
+        assert!(!f.registry.is_market_open(&id), "market {i} must be halted");
+        let market = f.registry.market(&id).expect("market still registered");
+        assert!(!market.is_active);
+    }
+    assert_eq!(f.registry.pause.suspended_count(), 3);
+}
+
+#[test]
+fn test_emergency_halt_blocks_every_operation() {
+    let mut f = pause_fixture(2);
+    // Fund market 0 while the protocol is healthy.
+    let mut position = f.fund(0, 1_000 * UNIT_PRICE, 500 * UNIT_PRICE);
+    let market_id = f.markets.get(0).unwrap();
+
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+
+    // Deposits, borrows, and market administration are refused.
+    assert!(f
+        .registry
+        .deposit(1_000, &market_id, &mut position, &f.collateral, UNIT_PRICE)
+        .is_err());
+    assert!(f
+        .registry
+        .borrow(
+            1_000,
+            &market_id,
+            &mut position,
+            &f.usdc,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_err());
+    assert!(f
+        .registry
+        .open_market(1_000, test_market(&f.env, &f.collateral, &f.usdc))
+        .is_err());
+
+    // ... and so are the unwind operations, because a full stop is a full stop.
+    assert!(f
+        .registry
+        .repay(1_000, &market_id, &mut position, &f.usdc, UNIT_PRICE)
+        .is_err());
+    assert!(f
+        .registry
+        .withdraw(
+            1_000,
+            &market_id,
+            &mut position,
+            &f.collateral,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_err());
+    assert!(f
+        .registry
+        .liquidate(1_000, &market_id, &mut position, UNIT_PRICE, &prices())
+        .is_err());
+
+    // A halt is reported ahead of an unknown market, so the pause state is
+    // never masked by a caller mistake.
+    assert_eq!(
+        f.registry
+            .deposit(1_000, &market_id, &mut position, &f.collateral, UNIT_PRICE)
+            .unwrap_err(),
+        "Protocol is halted by an emergency pause"
+    );
+
+    // Outside an incident, an unknown market id is reported as such.
+    let mut healthy = pause_fixture(1);
+    let unknown = Address::generate(&healthy.env);
+    let mut position = healthy.position(0);
+    assert_eq!(
+        healthy
+            .registry
+            .deposit(0, &unknown, &mut position, &healthy.collateral, UNIT_PRICE)
+            .unwrap_err(),
+        "Market is not registered"
+    );
+}
+
+#[test]
+fn test_emergency_halt_authorizes_admin_and_guardian_only() {
+    let mut f = pause_fixture(1);
+
+    assert_eq!(
+        f.registry
+            .halt_all(&f.env, &f.stranger, 1_000, "nope")
+            .unwrap_err(),
+        "Caller is not authorized to halt the protocol"
+    );
+    assert_eq!(f.registry.state(), EmergencyState::Normal);
+    assert_eq!(f.registry.halted_market_count(), 0);
+
+    // The guardian exists so an incident can be contained without governance.
+    f.registry
+        .halt_all(&f.env, &f.guardian, 1_000, "guardian halt")
+        .expect("guardian may halt");
+    assert_eq!(f.registry.state(), EmergencyState::Halted);
+    assert!(f.registry.pause.is_guardian(&f.guardian));
+    assert!(!f.registry.pause.is_guardian(&f.stranger));
+}
+
+#[test]
+fn test_guardian_cannot_resume_or_reconfigure() {
+    let mut f = pause_fixture(1);
+    f.registry
+        .halt_all(&f.env, &f.guardian, 1_000, "guardian halt")
+        .expect("halt");
+    f.registry
+        .begin_recovery(&f.env, &f.guardian)
+        .expect("guardian may open the unwind path");
+
+    // Stopping is urgent; restarting is a governance decision.
+    assert_eq!(
+        f.registry.resume_all(&f.env, &f.guardian).unwrap_err(),
+        "Caller is not the protocol admin"
+    );
+    assert_eq!(
+        f.registry
+            .set_op_pause(&f.env, &f.guardian, EmergencyOp::Borrow, true, 1_000, 0,)
+            .unwrap_err(),
+        "Caller is not the protocol admin"
+    );
+    assert_eq!(
+        f.registry
+            .pause
+            .set_guardian(&f.guardian, None)
+            .unwrap_err(),
+        "Caller is not the protocol admin"
+    );
+    assert_eq!(f.registry.state(), EmergencyState::Recovery);
+}
+
+#[test]
+fn test_recovery_opens_the_unwind_path_and_keeps_risk_shut() {
+    let mut f = pause_fixture(2);
+    let mut position = f.fund(0, 1_000 * UNIT_PRICE, 500 * UNIT_PRICE);
+    let market_id = f.markets.get(0).unwrap();
+
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+    f.registry
+        .begin_recovery(&f.env, &f.admin)
+        .expect("recovery");
+    assert_eq!(f.registry.state(), EmergencyState::Recovery);
+
+    // The cascade has been lifted, so the market is running again...
+    assert!(f.registry.is_market_open(&market_id));
+    assert_eq!(f.registry.halted_market_count(), 0);
+
+    // ... but nothing that opens new risk is allowed while unwinding.
+    assert!(f
+        .registry
+        .deposit(2_000, &market_id, &mut position, &f.collateral, UNIT_PRICE)
+        .is_err());
+    assert!(f
+        .registry
+        .borrow(
+            2_000,
+            &market_id,
+            &mut position,
+            &f.usdc,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_err());
+    assert!(f
+        .registry
+        .open_market(2_000, test_market(&f.env, &f.collateral, &f.usdc))
+        .is_err());
+
+    // Exits stay open: repay, then withdraw what is left.
+    let repaid = f
+        .registry
+        .repay(2_000, &market_id, &mut position, &f.usdc, 100 * UNIT_PRICE)
+        .expect("repay stays open in recovery");
+    assert_eq!(repaid, 100 * UNIT_PRICE);
+    f.registry
+        .withdraw(
+            2_000,
+            &market_id,
+            &mut position,
+            &f.collateral,
+            10 * UNIT_PRICE,
+            &prices(),
+        )
+        .expect("withdraw stays open in recovery");
+    assert_eq!(position.debt_amount, 400 * UNIT_PRICE);
+    assert_eq!(position.collateral_amount, 990 * UNIT_PRICE);
+}
+
+#[test]
+fn test_liquidation_stays_open_during_recovery() {
+    let mut f = pause_fixture(1);
+    // 100 tokens of collateral against 50 USDC of debt: a comfortable 50 % LTV.
+    let mut position = f.fund(0, 100 * UNIT_PRICE, 50 * UNIT_PRICE);
+
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+    f.registry
+        .begin_recovery(&f.env, &f.admin)
+        .expect("recovery");
+
+    // The collateral then loses 95 % of its value, which is exactly the
+    // situation an emergency pause is called for.
+    let crashed = PriceContext {
+        collateral_price: 500_000,
+        borrow_price: UNIT_PRICE,
+        decimals: DECIMALS,
+    };
+    let market_id = f.markets.get(0).unwrap();
+    let (repaid, seized) = f
+        .registry
+        .liquidate(2_000, &market_id, &mut position, 50 * UNIT_PRICE, &crashed)
+        .expect("liquidation must never be the casualty of a pause");
+    assert!(repaid > 0);
+    assert_eq!(position.collateral_amount, 100 * UNIT_PRICE - seized);
+
+    // The collateral is gone but 2.4 USDC of debt cannot be covered, so it is
+    // contained inside this market instead of propagating anywhere else.
+    let market = f.registry.market(&market_id).expect("market");
+    assert_eq!(position.collateral_amount, 0);
+    assert_eq!(position.debt_amount, 0);
+    assert_eq!(market.total_collateral, 0);
+    assert_eq!(market.current_debt, 0);
+    assert_eq!(market.bad_debt_contained, 50 * UNIT_PRICE - repaid);
+}
+
+#[test]
+fn test_resume_requires_the_recovery_step_first() {
+    let mut f = pause_fixture(1);
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+
+    // Skipping the unwind window would restart deposits against a protocol that
+    // nobody has inspected yet.
+    assert_eq!(
+        f.registry.resume_all(&f.env, &f.admin).unwrap_err(),
+        "Enter recovery before resuming so users can exit"
+    );
+    assert_eq!(f.registry.state(), EmergencyState::Halted);
+
+    f.registry
+        .begin_recovery(&f.env, &f.admin)
+        .expect("recovery");
+    let transition = f.registry.resume_all(&f.env, &f.admin).expect("resume");
+    assert_eq!(transition.from, EmergencyState::Recovery);
+    assert_eq!(transition.to, EmergencyState::Normal);
+    assert_eq!(f.registry.state(), EmergencyState::Normal);
+    assert_eq!(f.registry.halted_market_count(), 0);
+}
+
+#[test]
+fn test_recovery_must_follow_a_halt() {
+    let mut f = pause_fixture(1);
+    assert_eq!(
+        f.registry.begin_recovery(&f.env, &f.admin).unwrap_err(),
+        "Recovery must follow a halt"
+    );
+    assert_eq!(f.registry.state(), EmergencyState::Normal);
+}
+
+#[test]
+fn test_resume_restores_only_markets_the_cascade_suspended() {
+    let mut f = pause_fixture(3);
+    let market_id = f.markets.get(1).unwrap();
+
+    // Governance took market 1 down for an unrelated reason before the incident.
+    let mut offline = f.registry.market(&market_id).expect("market registered");
+    offline.is_active = false;
+    let index = f.registry.index_of(&market_id).unwrap();
+    f.registry.markets.set(index, offline);
+    assert_eq!(f.registry.halted_market_count(), 1);
+
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+    assert_eq!(f.registry.halted_market_count(), 3);
+    // Only the two running markets were recorded as cascade-suspended.
+    assert_eq!(f.registry.pause.suspended_count(), 2);
+
+    f.registry
+        .resume_all(&f.env, &f.admin)
+        .or_else(|_| {
+            f.registry.begin_recovery(&f.env, &f.admin)?;
+            f.registry.resume_all(&f.env, &f.admin)
+        })
+        .expect("resume");
+
+    // Market 1 stays down; the cascade did not resurrect it.
+    assert!(!f.registry.is_market_open(&market_id));
+    assert_eq!(f.registry.halted_market_count(), 1);
+    assert!(f.registry.is_market_open(&f.markets.get(0).unwrap()));
+    assert!(f.registry.is_market_open(&f.markets.get(2).unwrap()));
+    assert_eq!(f.registry.pause.suspended_count(), 0);
+}
+
+#[test]
+fn test_rehalt_preserves_the_original_incident_time_and_reason() {
+    let mut f = pause_fixture(1);
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "first reason")
+        .expect("halt");
+
+    // A second halt by the guardian must not overwrite the post-mortem record.
+    f.registry
+        .halt_all(&f.env, &f.guardian, 9_000, "second reason")
+        .expect("re-halt");
+    assert_eq!(f.registry.pause.halted_at, 1_000);
+    assert_eq!(
+        f.registry.pause.reason,
+        soroban_sdk::Bytes::from_slice(&f.env, b"first reason")
+    );
+}
+
+#[test]
+fn test_per_operation_pause_is_independent_of_the_lifecycle() {
+    let mut f = pause_fixture(1);
+    let mut position = f.position(0);
+    let market_id = f.markets.get(0).unwrap();
+
+    f.registry
+        .set_op_pause(&f.env, &f.admin, EmergencyOp::Borrow, true, 500, 0)
+        .expect("admin may pause an operation");
+
+    // Only borrowing is shut; the protocol is not in an incident.
+    assert_eq!(f.registry.state(), EmergencyState::Normal);
+    assert!(f
+        .registry
+        .deposit(
+            500,
+            &market_id,
+            &mut position,
+            &f.collateral,
+            1_000 * UNIT_PRICE
+        )
+        .is_ok());
+    assert!(f
+        .registry
+        .borrow(
+            500,
+            &market_id,
+            &mut position,
+            &f.usdc,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_err());
+    // Repaying and withdrawing are untouched: the switch is per operation.
+    assert_eq!(
+        f.registry
+            .repay(500, &market_id, &mut position, &f.usdc, UNIT_PRICE)
+            .expect("repay is not paused"),
+        0
+    );
+    assert!(f
+        .registry
+        .withdraw(
+            500,
+            &market_id,
+            &mut position,
+            &f.collateral,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_ok());
+}
+
+#[test]
+fn test_per_operation_pause_fuse_expires_on_its_own() {
+    let mut f = pause_fixture(1);
+    let mut position = f.position(0);
+    let market_id = f.markets.get(0).unwrap();
+
+    // A 600-second fuse on deposits.
+    f.registry
+        .set_op_pause(&f.env, &f.admin, EmergencyOp::Deposit, true, 500, 600)
+        .expect("fuse set");
+    let switch = f.registry.pause.op_pause(EmergencyOp::Deposit);
+    assert!(switch.paused);
+    assert_eq!(switch.expires_at, 1_100);
+    assert!(switch.engaged(1_099));
+    assert!(!switch.engaged(1_100));
+
+    assert!(f
+        .registry
+        .deposit(600, &market_id, &mut position, &f.collateral, UNIT_PRICE)
+        .is_err());
+    // A forgotten one-shot kill switch must not stay engaged forever.
+    assert!(f
+        .registry
+        .deposit(1_100, &market_id, &mut position, &f.collateral, UNIT_PRICE)
+        .is_ok());
+}
+
+#[test]
+fn test_per_operation_pause_without_cooldown_stays_engaged() {
+    let mut f = pause_fixture(1);
+    let mut position = f.position(0);
+    let market_id = f.markets.get(0).unwrap();
+
+    f.registry
+        .set_op_pause(&f.env, &f.admin, EmergencyOp::Withdraw, true, 500, 0)
+        .expect("kill switch set");
+    let switch = f.registry.pause.op_pause(EmergencyOp::Withdraw);
+    assert!(switch.engaged(u64::MAX));
+
+    assert!(f
+        .registry
+        .withdraw(
+            10_000_000_000,
+            &market_id,
+            &mut position,
+            &f.collateral,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_err());
+
+    // Lifting it explicitly is the only way out.
+    f.registry
+        .set_op_pause(
+            &f.env,
+            &f.admin,
+            EmergencyOp::Withdraw,
+            false,
+            10_000_000_000,
+            0,
+        )
+        .expect("kill switch lifted");
+    assert!(!f
+        .registry
+        .pause
+        .op_pause(EmergencyOp::Withdraw)
+        .engaged(10_000_000_000));
+}
+
+#[test]
+fn test_master_switch_cannot_be_set_by_hand() {
+    let mut f = pause_fixture(1);
+    assert_eq!(
+        f.registry
+            .set_op_pause(&f.env, &f.admin, EmergencyOp::All, true, 0, 0)
+            .unwrap_err(),
+        "Use halt/resume to control the master switch"
+    );
+    assert_eq!(
+        f.registry.pause.op_pause(EmergencyOp::All),
+        OpPause {
+            paused: false,
+            expires_at: 0
+        }
+    );
+}
+
+#[test]
+fn test_resume_clears_every_inherited_kill_switch() {
+    let mut f = pause_fixture(1);
+    let mut position = f.fund(0, 1_000 * UNIT_PRICE, 100 * UNIT_PRICE);
+    let market_id = f.markets.get(0).unwrap();
+
+    f.registry
+        .set_op_pause(&f.env, &f.admin, EmergencyOp::Borrow, true, 0, 0)
+        .expect("pre-incident kill switch");
+
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+    f.registry
+        .begin_recovery(&f.env, &f.admin)
+        .expect("recovery");
+    f.registry.resume_all(&f.env, &f.admin).expect("resume");
+
+    // Coming out of an incident must not silently inherit a switch that was set
+    // before it.
+    assert!(!f.registry.pause.op_pause(EmergencyOp::Borrow).paused);
+    assert!(f
+        .registry
+        .borrow(
+            2_000,
+            &market_id,
+            &mut position,
+            &f.usdc,
+            UNIT_PRICE,
+            &prices(),
+        )
+        .is_ok());
+}
+
+#[test]
+fn test_paused_operation_leaves_market_accounting_untouched() {
+    let mut f = pause_fixture(1);
+    let mut position = f.fund(0, 1_000 * UNIT_PRICE, 500 * UNIT_PRICE);
+    let market_id = f.markets.get(0).unwrap();
+    let before = f.registry.market(&market_id).expect("market");
+
+    f.registry
+        .halt_all(&f.env, &f.admin, 1_000, "incident")
+        .expect("halt");
+
+    // Rejected operations must not half-apply: a blocked borrow cannot be the
+    // reason a market's debt accounting drifts.
+    assert!(f
+        .registry
+        .borrow(
+            1_000,
+            &market_id,
+            &mut position,
+            &f.usdc,
+            400 * UNIT_PRICE,
+            &prices(),
+        )
+        .is_err());
+    let during = f.registry.market(&market_id).expect("market");
+    // Only `is_active` changed; debt and collateral are exactly as before.
+    assert_eq!(during.current_debt, before.current_debt);
+    assert_eq!(during.total_collateral, before.total_collateral);
+    assert_eq!(during.bad_debt_contained, before.bad_debt_contained);
+    assert!(!during.is_active);
+    assert_eq!(position.debt_amount, 500 * UNIT_PRICE);
+}
+
+#[test]
+fn test_duplicate_market_registration_is_rejected() {
+    let mut f = pause_fixture(1);
+    let existing = f.markets.get(0).unwrap();
+    // Same market id, different assets: a re-registration must not be able to
+    // silently replace the incumbent market.
+    let duplicate = IsolatedMarket::new(
+        existing.clone(),
+        Address::generate(&f.env),
+        Address::generate(&f.env),
+        1_000_000 * UNIT_PRICE,
+        6000,
+        7000,
+        500,
+    )
+    .expect("valid market parameters");
+
+    assert_eq!(
+        f.registry.open_market(0, duplicate).unwrap_err(),
+        "Market is already registered"
+    );
+    assert_eq!(f.registry.market_count(), 1);
+}
+
+#[test]
+fn test_guardian_rotation_is_admin_only_and_takes_effect() {
+    let mut f = pause_fixture(1);
+    let replacement = Address::generate(&f.env);
+
+    f.registry
+        .pause
+        .set_guardian(&f.admin, Some(replacement.clone()))
+        .expect("admin rotates the guardian");
+    assert_eq!(f.registry.guardian(), Some(replacement.clone()));
+    assert!(!f.registry.pause.is_guardian(&f.guardian));
+
+    // The new guardian can halt; the old one can no longer.
+    f.registry
+        .halt_all(&f.env, &replacement, 1_000, "new guardian")
+        .expect("new guardian may halt");
+    assert_eq!(
+        f.registry
+            .halt_all(&f.env, &f.guardian, 2_000, "old guardian")
+            .unwrap_err(),
+        "Caller is not authorized to halt the protocol"
+    );
+
+    // ... and the guardian can be removed entirely.
+    f.registry
+        .pause
+        .set_guardian(&f.admin, None)
+        .expect("admin clears the guardian");
+    assert_eq!(f.registry.guardian(), None);
+}
+
+#[test]
+fn test_registry_without_a_guardian_only_halts_for_the_admin() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let collateral = Address::generate(&env);
+    let usdc = Address::generate(&env);
+
+    let mut registry = MarketRegistry::new(&env, admin.clone(), None);
+    registry
+        .open_market(0, test_market(&env, &collateral, &usdc))
+        .expect("market");
+
+    assert!(registry.halt_all(&env, &stranger, 1_000, "nope").is_err());
+    assert_eq!(registry.state(), EmergencyState::Normal);
+    registry
+        .halt_all(&env, &admin, 1_000, "ok")
+        .expect("admin may halt");
+    assert_eq!(registry.state(), EmergencyState::Halted);
 }

@@ -28,6 +28,9 @@ mod cache;
 mod fallback;
 mod feeds;
 mod health;
+mod heartbeat;
+mod history;
+mod incentives;
 mod interface;
 mod provider;
 mod storage;
@@ -39,8 +42,9 @@ mod tests;
 
 use crate::types::{
     AggregatedPrice, AggregationParams, AggregationStrategy, CacheConfigUpdatedEvent, CacheStats,
-    FeedMode, FeedPriority, FeedQuote, OracleHealthStatus, PriceFeed, PricePoint, PriceSource,
-    ProviderPrice, VERSION,
+    FeedMode, FeedPriority, FeedQuote, HeartbeatConfig, IncentiveConfig, OracleHealthStatus,
+    PriceFeed, PriceHistoryConfig, PricePoint, PriceSource, ProviderPrice, ReporterRewards,
+    VERSION,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, panic_with_error, Address, Bytes, BytesN, Env, Vec,
@@ -64,6 +68,14 @@ pub enum OracleHubError {
     FeedSlotOccupied = 10,
     /// Too few sources agreed to publish a price.
     InsufficientSources = 11,
+    /// A monitored feed slot stopped reporting past its expiry, so the hub
+    /// refuses to serve a price nobody is updating.
+    HeartbeatExpired = 12,
+    /// The reward pool cannot cover a claim or withdrawal reporters have
+    /// already earned against.
+    RewardPoolShortfall = 13,
+    /// A reporter's earnings would exceed the largest representable balance.
+    RewardOverflow = 14,
 }
 
 /// The Oracle Hub contract.
@@ -591,6 +603,13 @@ impl OracleHubContract {
         let latest_key = storage::DataKey::LatestPrice(asset.clone(), priority as u32);
         env.storage().instance().set(&latest_key, &price_point);
 
+        // The report is the slot's heartbeat.
+        heartbeat::record_beat(&env, &asset, priority as u32);
+
+        // Reporting is what the programme pays for, so an accepted report earns
+        // its reward here and nowhere else.
+        incentives::accrue(&env, &feed.oracle_address, &asset);
+
         types::PriceReportedEvent {
             asset,
             priority: priority as u32,
@@ -659,6 +678,178 @@ impl OracleHubContract {
     /// Read-only health snapshot for an asset.
     pub fn get_health(env: Env, asset: Bytes) -> OracleHealthStatus {
         health::get_health(&env, &asset)
+    }
+
+    // ── Heartbeat monitoring ───────────────────────────────────────────────
+
+    /// Heartbeat expectations for an asset, or the hub default.
+    pub fn get_heartbeat_config(env: Env, asset: Option<Bytes>) -> HeartbeatConfig {
+        match asset {
+            Some(asset) => heartbeat::config(&env, &asset),
+            None => heartbeat::default_config(&env),
+        }
+    }
+
+    /// Set heartbeat expectations for one asset, or for every asset.
+    ///
+    /// A `None` asset rewrites the default that unconfigured assets inherit, so
+    /// a hub can turn monitoring on protocol-wide and override single assets
+    /// later. Governance only.
+    pub fn set_heartbeat_config(env: Env, asset: Option<Bytes>, config: HeartbeatConfig) {
+        let governance = require_governance(&env);
+        governance.require_auth();
+        require_not_frozen(&env);
+        heartbeat::set_config(&env, asset.as_ref(), &config);
+    }
+
+    /// Liveness of every registered feed slot of an asset, without side
+    /// effects. Use this to alert; use [`Self::sweep_heartbeats`] to act.
+    pub fn get_heartbeats(env: Env, asset: Bytes) -> Vec<types::HeartbeatSlotStatus> {
+        heartbeat::statuses(&env, &asset)
+    }
+
+    /// Liveness of a single feed slot.
+    pub fn get_heartbeat(
+        env: Env,
+        asset: Bytes,
+        priority: FeedPriority,
+    ) -> types::HeartbeatSlotStatus {
+        heartbeat::slot_status(&env, &asset, priority as u32)
+    }
+
+    /// Advance heartbeat state and trip the asset breaker on expiry.
+    ///
+    /// Permissionless: a keeper, a consumer, or anyone else may call it. The
+    /// call is idempotent and publishes only the transitions it has not
+    /// published before, so running it on a schedule costs nothing extra.
+    pub fn sweep_heartbeats(env: Env, asset: Bytes) -> Vec<types::HeartbeatSlotStatus> {
+        require_not_frozen(&env);
+        heartbeat::sweep(&env, &asset)
+    }
+
+    /// Ledger time at which a slot's silence expires, or `0` when it has never
+    /// reported.
+    pub fn heartbeat_expiry(env: Env, asset: Bytes, priority: FeedPriority) -> u64 {
+        heartbeat::expires_at(&env, &asset, priority as u32)
+    }
+
+    // -- Price history -----------------------------------------------------
+
+    /// Set how many resolved prices are retained for audit.
+    ///
+    /// Pass `None` for the hub-wide default, or an asset for an override. A
+    /// limit of `0` disables history for that scope and drops what it holds;
+    /// lowering a limit prunes the entries that no longer fit.
+    pub fn set_history_limit(env: Env, asset: Option<Bytes>, max_entries: u32) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        history::set_limit(&env, asset.as_ref(), max_entries);
+    }
+
+    /// Retention configured for an asset, and how much of it is used.
+    pub fn get_history_config(env: Env, asset: Bytes) -> PriceHistoryConfig {
+        history::config(&env, &asset)
+    }
+
+    /// The retained history of an asset, oldest first.
+    pub fn get_price_history(env: Env, asset: Bytes) -> Vec<types::PriceHistoryEntry> {
+        history::entries(&env, &asset)
+    }
+
+    /// The retained history of an asset within a closed timestamp window.
+    pub fn get_price_history_range(
+        env: Env,
+        asset: Bytes,
+        from_timestamp: u64,
+        to_timestamp: u64,
+    ) -> Vec<types::PriceHistoryEntry> {
+        history::entries_between(&env, &asset, from_timestamp, to_timestamp)
+    }
+
+    /// Drop an asset's history entirely.
+    pub fn clear_price_history(env: Env, asset: Bytes) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        if history::limit(&env, &asset) == 0 {
+            return;
+        }
+        history::clear(&env, &asset);
+    }
+
+    // ── Reporter incentives ─────────────────────────────────────────────────
+
+    /// Choose the token reporter rewards are paid in. Settable once: outstanding
+    /// rewards are denominated in it, and swapping it afterwards would
+    /// reinterpret them.
+    pub fn set_reward_token(env: Env, token: Address) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        incentives::set_token(&env, &token);
+    }
+
+    /// Turn the incentive programme on or off. Turning it off stops accrual;
+    /// already earned rewards stay claimable.
+    pub fn set_incentives_enabled(env: Env, enabled: bool) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        incentives::set_enabled(&env, enabled);
+    }
+
+    /// Set the reward for one accepted report of an asset, in the reward
+    /// token's base units. Pass `None` for the hub-wide default.
+    ///
+    /// Refuses a rate above `incentives::MAX_REWARD_PER_REPORT`, so a typo
+    /// cannot drain a funded pool in one block.
+    pub fn set_reward_per_report(env: Env, asset: Option<Bytes>, reward: i128) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        incentives::set_rate(&env, asset.as_ref(), reward);
+    }
+
+    /// Set how long one oracle must wait before a second report of the same
+    /// asset earns a reward again. `0` removes the guard.
+    pub fn set_reward_min_interval(env: Env, seconds: u64) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        incentives::set_min_interval(&env, seconds);
+    }
+
+    /// Incentive settings in force for an asset, as a view.
+    pub fn get_incentive_config(env: Env, asset: Option<Bytes>) -> IncentiveConfig {
+        incentives::config(&env, asset.as_ref())
+    }
+
+    /// Governance tops the reward pool up.
+    pub fn fund_rewards(env: Env, amount: i128) {
+        require_not_frozen(&env);
+        let governance = require_governance(&env);
+        governance.require_auth();
+        incentives::fund(&env, &governance, amount);
+    }
+
+    /// Pay a reporter everything it has earned.
+    ///
+    /// Reverts when the pool cannot cover the claim, rather than paying out
+    /// less than the books promise. The reporter's own authorization is
+    /// required.
+    pub fn claim_rewards(env: Env, oracle: Address) {
+        require_not_frozen(&env);
+        oracle.require_auth();
+        incentives::claim(&env, &oracle);
+    }
+
+    /// Governance recovers tokens from the reward pool, e.g. to wind the
+    /// programme down. Refuses to take the pool below what reporters have
+    /// already earned.
+    pub fn withdraw_rewards(env: Env, to: Address, amount: i128) {
+        require_not_frozen(&env);
+        require_governance(&env).require_auth();
+        incentives::withdraw(&env, &to, amount);
+    }
+
+    /// A reporter's earnings and the state of the pool funding them.
+    pub fn get_rewards(env: Env, oracle: Address) -> ReporterRewards {
+        incentives::rewards_of(&env, &oracle)
     }
 }
 
@@ -763,6 +954,9 @@ fn collect_quotes(env: &Env, asset: &Bytes) -> (Vec<FeedQuote>, bool) {
             .publish(env);
             let point = provider::to_price_point(env, asset, fetched);
             env.storage().instance().set(&latest_key, &point);
+            // A live pull is proof the provider is alive, so it counts as a
+            // heartbeat for the slot.
+            heartbeat::record_beat(env, asset, slot);
             Some(point)
         } else {
             env.storage().instance().get::<_, PricePoint>(&latest_key)
@@ -796,6 +990,11 @@ fn resolve(env: &Env, asset: &Bytes) -> AggregatedPrice {
     require_not_frozen(env);
     if health::is_frozen(env, asset) {
         panic_with_error!(env, OracleHubError::Frozen);
+    }
+    // An expired heartbeat means a monitored source stopped reporting. Serving
+    // its last price anyway is how a dead oracle becomes a protocol loss.
+    if heartbeat::is_expired(env, asset) {
+        panic_with_error!(env, OracleHubError::HeartbeatExpired);
     }
 
     let now = env.ledger().timestamp();
@@ -862,6 +1061,19 @@ fn resolve(env: &Env, asset: &Bytes) -> AggregatedPrice {
         aggregated.clone(),
         now,
         outcome.min_stale_threshold,
+    );
+    // Recorded only on a fresh resolution, so the audit trail is the sequence of
+    // prices the hub published rather than one row per consumer that read them.
+    history::record(
+        env,
+        asset,
+        aggregated.price,
+        aggregated.confidence,
+        aggregated.num_feeds,
+        aggregated.num_active_feeds,
+        &aggregated.strategy,
+        aggregated.used_fallback,
+        aggregated.deviation_bps,
     );
     aggregated
 }

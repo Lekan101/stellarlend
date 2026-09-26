@@ -92,6 +92,29 @@ pub fn active_feed_count(env: &Env, asset: &Bytes) -> u32 {
     active
 }
 
+/// Open the automatic per-asset breaker unless it is already open, and report
+/// whether this call is what opened it.
+///
+/// Shared by failure-threshold monitoring and heartbeat expiry so both produce
+/// the same state, the same cooldown, and the same event.
+pub fn open_auto_breaker(env: &Env, asset: &Bytes, now: &u64) -> bool {
+    if is_frozen(env, asset) {
+        return false;
+    }
+    let state = BreakerState {
+        open_until: now.saturating_add(DEFAULT_BREAKER_COOLDOWN_SECONDS),
+        auto: true,
+    };
+    set_breaker(env, asset, &state);
+    crate::types::BreakerOpenedEvent {
+        asset: asset.clone(),
+        open_until: state.open_until,
+        auto: true,
+    }
+    .publish(env);
+    true
+}
+
 /// Record a failed price fetch for an asset and auto-open the breaker once the
 /// consecutive failure threshold is reached.
 pub fn monitor_oracle_health(env: &Env, asset: &Bytes) -> OracleHealthStatus {
@@ -101,24 +124,9 @@ pub fn monitor_oracle_health(env: &Env, asset: &Bytes) -> OracleHealthStatus {
         .set(&DataKey::ConsecutiveFailures(asset.clone()), &failures);
 
     let last_success = get_last_success(env, asset);
-    let breaker_open = is_frozen(env, asset);
-    let mut auto_triggered = false;
-
-    if failures >= AUTO_BREAKER_FAILURE_THRESHOLD && !breaker_open {
-        let now = env.ledger().timestamp();
-        let state = BreakerState {
-            open_until: now.saturating_add(DEFAULT_BREAKER_COOLDOWN_SECONDS),
-            auto: true,
-        };
-        set_breaker(env, asset, &state);
-        auto_triggered = true;
-        crate::types::BreakerOpenedEvent {
-            asset: asset.clone(),
-            open_until: state.open_until,
-            auto: true,
-        }
-        .publish(env);
-    }
+    let now = env.ledger().timestamp();
+    let auto_triggered =
+        failures >= AUTO_BREAKER_FAILURE_THRESHOLD && open_auto_breaker(env, asset, &now);
 
     crate::types::HealthFailureEvent {
         asset: asset.clone(),

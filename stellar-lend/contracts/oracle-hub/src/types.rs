@@ -285,6 +285,79 @@ pub struct ProviderPrice {
     pub confidence: u32,
 }
 
+// ── Heartbeat monitoring ────────────────────────────────────────────────────
+
+/// Liveness classification of a single feed slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum HeartbeatStatus {
+    /// The slot reported inside its interval.
+    Fresh = 0,
+    /// The interval elapsed but the slot is not stale yet.
+    Due = 1,
+    /// The slot has missed too long and its last price is not trustworthy.
+    Stale = 2,
+    /// The slot has been silent past its expiry. Pricing for the asset is
+    /// refused until a report arrives.
+    Expired = 3,
+    /// The slot has never reported since monitoring was configured.
+    Silent = 4,
+}
+
+/// Per-asset (or default) heartbeat expectations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct HeartbeatConfig {
+    /// When false the asset is not monitored at all.
+    pub enabled: bool,
+    /// Expected reporting cadence.
+    pub interval_seconds: u64,
+    /// Silence past this age marks the slot stale.
+    pub stale_after_seconds: u64,
+    /// Silence past this age expires the slot and fails the asset closed.
+    pub expiry_seconds: u64,
+}
+
+impl HeartbeatConfig {
+    /// Monitoring off; every slot is treated as healthy.
+    pub fn disabled() -> Self {
+        HeartbeatConfig {
+            enabled: false,
+            interval_seconds: crate::heartbeat::DEFAULT_INTERVAL_SECONDS,
+            stale_after_seconds: crate::heartbeat::DEFAULT_STALE_AFTER_SECONDS,
+            expiry_seconds: crate::heartbeat::DEFAULT_EXPIRY_SECONDS,
+        }
+    }
+}
+
+/// Persisted liveness bookkeeping for one feed slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct HeartbeatSlotState {
+    /// Ledger time of the last accepted report or successful pull.
+    pub last_seen: u64,
+    /// Missed intervals since `last_seen`, as of the last sweep.
+    pub missed_beats: u32,
+    /// Classification produced by the last sweep, so only transitions are
+    /// published.
+    pub last_status: HeartbeatStatus,
+}
+
+/// Read-only liveness view of one feed slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct HeartbeatSlotStatus {
+    pub asset: Bytes,
+    /// Feed slot, i.e. the `FeedPriority` of the source.
+    pub priority: u32,
+    pub status: HeartbeatStatus,
+    /// Ledger time of the last accepted report or pull. `0` when silent.
+    pub last_seen: u64,
+    /// Age of that report at query time.
+    pub age_seconds: u64,
+    pub missed_beats: u32,
+}
+
 // ── Contract events ────────────────────────────────────────────────────────
 
 #[contractevent]
@@ -482,6 +555,51 @@ pub struct UnfrozenEvent {
     pub admin: Address,
 }
 
+/// Emitted when a slot's heartbeat is accepted after a degraded period.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct HeartbeatRecoveredEvent {
+    #[topic]
+    pub asset: Bytes,
+    pub priority: u32,
+    pub status: HeartbeatStatus,
+    pub silence_seconds: u64,
+}
+
+/// Emitted when a slot crosses the stale threshold.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct HeartbeatStaleEvent {
+    #[topic]
+    pub asset: Bytes,
+    pub priority: u32,
+    pub age_seconds: u64,
+    pub missed_beats: u32,
+}
+
+/// Emitted when a slot passes its expiry and the asset fails closed.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct HeartbeatExpiredEvent {
+    #[topic]
+    pub asset: Bytes,
+    pub priority: u32,
+    pub age_seconds: u64,
+    pub missed_beats: u32,
+}
+
+/// Emitted when heartbeat expectations are changed.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct HeartbeatConfigUpdatedEvent {
+    #[topic]
+    pub asset: Bytes,
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub stale_after_seconds: u64,
+    pub expiry_seconds: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug)]
 pub struct UpgradeStagedEvent {
@@ -513,4 +631,148 @@ pub struct UpgradeApprovedEvent {
     pub approver: Address,
     pub approval_count: u32,
     pub timelock_until: u64,
+}
+
+// -- Price history -----------------------------------------------------------
+
+/// One resolved price, retained for audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PriceHistoryEntry {
+    /// Asset this price was published for.
+    pub asset: Bytes,
+    /// Ledger time of the resolution.
+    pub timestamp: u64,
+    /// Aggregated price in canonical decimals.
+    pub price: i128,
+    /// Aggregate confidence of the quotes behind it.
+    pub confidence: u32,
+    /// Quotes that participated in the aggregate.
+    pub num_feeds: u32,
+    /// Non-stale, enabled sources observed for the asset.
+    pub num_active_feeds: u32,
+    /// Strategy that produced it.
+    pub strategy: AggregationStrategy,
+    /// True when a single source, or a demoted leader, produced it.
+    pub used_fallback: bool,
+    /// Largest disagreement inside the accepted set, in basis points.
+    pub deviation_bps: i128,
+}
+
+/// Configured retention for an asset and how much of it is used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PriceHistoryConfig {
+    pub asset: Bytes,
+    /// Entries retained; `0` means history is off for this asset.
+    pub max_entries: u32,
+    /// Entries currently retained.
+    pub recorded: u32,
+}
+
+/// Emitted when history retention is changed.
+///
+/// The explicit topic overrides the derived snake-case name, which would exceed
+/// the 32-character symbol limit.
+#[contractevent(topics = ["history_config_updated"])]
+#[derive(Clone, Debug)]
+pub struct PriceHistoryConfigUpdatedEvent {
+    #[topic]
+    pub asset: Bytes,
+    pub max_entries: u32,
+}
+
+/// Emitted when an asset's history is dropped, whether by a limit change or an
+/// explicit clear.
+#[contractevent(topics = ["history_cleared"])]
+#[derive(Clone, Debug)]
+pub struct PriceHistoryClearedEvent {
+    #[topic]
+    pub asset: Bytes,
+    pub removed: u32,
+}
+
+// -- Reporter incentives ------------------------------------------------------
+
+/// Incentive settings in force for an asset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct IncentiveConfig {
+    /// Whether an accepted report earns anything.
+    pub enabled: bool,
+    /// Reward for one accepted report, in the reward token's base units.
+    /// `0` means reporting earns nothing for this asset.
+    pub reward_per_report: i128,
+    /// Minimum spacing between two rewarded reports by one oracle for one asset.
+    pub min_interval_seconds: u64,
+}
+
+/// A reporter's earnings and the state of the pool funding them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ReporterRewards {
+    pub oracle: Address,
+    /// The token rewards are paid in, if governance has chosen one.
+    pub token: Option<Address>,
+    /// Claimable balance, in token base units.
+    pub accrued: i128,
+    /// Tokens the hub holds for rewards.
+    pub pool_balance: i128,
+    /// Everything reporters have earned and not yet claimed, hub-wide.
+    pub total_owed: i128,
+    /// How many of this reporter's reports have earned a reward.
+    pub reports_rewarded: u32,
+}
+
+/// Emitted when the incentive programme or a reward rate changes.
+#[contractevent(topics = ["incentives_config_updated"])]
+#[derive(Clone, Debug)]
+pub struct IncentiveConfigUpdatedEvent {
+    /// Asset the change applies to; empty means it applies hub-wide.
+    #[topic]
+    pub asset: Bytes,
+    pub enabled: bool,
+    pub reward_per_report: i128,
+    pub min_interval_seconds: u64,
+}
+
+/// Emitted when governance chooses the reward token. This happens once.
+#[contractevent(topics = ["reward_token_set"])]
+#[derive(Clone, Debug)]
+pub struct RewardTokenSetEvent {
+    #[topic]
+    pub token: Address,
+}
+
+/// Emitted when governance funds the reward pool.
+#[contractevent(topics = ["rewards_funded"])]
+#[derive(Clone, Debug)]
+pub struct RewardsFundedEvent {
+    #[topic]
+    pub funder: Address,
+    pub amount: i128,
+    /// Pool balance after the transfer.
+    pub pool_balance: i128,
+}
+
+/// Emitted when a reporter claims what it has earned.
+#[contractevent(topics = ["rewards_claimed"])]
+#[derive(Clone, Debug)]
+pub struct RewardsClaimedEvent {
+    #[topic]
+    pub oracle: Address,
+    pub amount: i128,
+    /// Pool balance after the payout.
+    pub pool_balance: i128,
+}
+
+/// Emitted when governance recovers tokens from the reward pool.
+#[contractevent(topics = ["rewards_withdrawn"])]
+#[derive(Clone, Debug)]
+pub struct RewardsWithdrawnEvent {
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+    /// Pool balance after the withdrawal.
+    pub pool_balance: i128,
 }
