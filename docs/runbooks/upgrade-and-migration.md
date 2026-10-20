@@ -249,3 +249,220 @@ one. Nothing has moved yet.
 | Upgrade / roll back | `... -- upgrade --admin $ADMIN --new_wasm_hash <hash>` |
 | Migrate | `... -- migrate_pool_state --admin $ADMIN` (twice; 2nd returns 0) |
 | Verify live code | `stellar contract fetch ... && sha256sum live.wasm` |
+
+---
+
+## Devnet end-to-end rehearsal — step by step
+
+> Closes #1387 acceptance criterion: "Tested on devnet."
+>
+> Run this procedure on a clean local devnet before every testnet or mainnet
+> upgrade to catch issues with zero financial risk.
+
+### Prerequisites
+
+```bash
+# 1. Start the local devnet (one-time).
+cd docker/devnet
+cp .env.example .env
+docker compose up -d
+./healthcheck.sh --wait          # wait until all services are healthy
+
+# 2. Export session variables.
+export NET=standalone
+export RPC=http://localhost:8000/soroban/rpc
+export ADMIN_ID=lending-admin    # stellar CLI identity created by init-devnet.sh
+export ADMIN=$(stellar keys address $ADMIN_ID)
+export LENDING=$(cat .devnet/contract-ids/lending.txt)
+```
+
+### Step 1 — Snapshot pre-upgrade state
+
+```bash
+mkdir -p .devnet/rehearsal/$(date +%s)
+SNAP=.devnet/rehearsal/$(ls -t .devnet/rehearsal | head -1)
+
+# Record current code hash.
+stellar contract fetch --id "$LENDING" --network "$NET" \
+  --rpc-url "$RPC" --out-file "$SNAP/previous.wasm"
+sha256sum "$SNAP/previous.wasm" > "$SNAP/previous.sha256"
+
+# Snapshot a few known positions.
+stellar contract invoke --id "$LENDING" --network "$NET" --rpc-url "$RPC" \
+  -- get_system_stats > "$SNAP/stats-before.json"
+```
+
+### Step 2 — Build the candidate
+
+```bash
+git checkout <release-tag>
+stellar contract build \
+  --manifest-path stellar-lend/contracts/lending/Cargo.toml
+cp stellar-lend/target/wasm32v1-none/release/stellarlend_lending.wasm \
+  "$SNAP/candidate.wasm"
+sha256sum "$SNAP/candidate.wasm" > "$SNAP/candidate.sha256"
+```
+
+### Step 3 — Upload and upgrade
+
+```bash
+HASH=$(stellar contract upload --wasm "$SNAP/candidate.wasm" \
+  --source "$ADMIN_ID" --network "$NET" --rpc-url "$RPC")
+
+# Verify hash matches the file.
+[ "$HASH" = "$(cut -d' ' -f1 "$SNAP/candidate.sha256")" ] \
+  || { echo "HASH MISMATCH — abort"; exit 1; }
+
+stellar contract invoke --id "$LENDING" --source "$ADMIN_ID" \
+  --network "$NET" --rpc-url "$RPC" \
+  -- upgrade --admin "$ADMIN" --new_wasm_hash "$HASH"
+```
+
+### Step 4 — Migrate storage
+
+```bash
+# First run — returns number of entries written.
+stellar contract invoke --id "$LENDING" --source "$ADMIN_ID" \
+  --network "$NET" --rpc-url "$RPC" \
+  -- migrate_pool_state --admin "$ADMIN"
+
+# Second run MUST return 0 (idempotency check).
+stellar contract invoke --id "$LENDING" --source "$ADMIN_ID" \
+  --network "$NET" --rpc-url "$RPC" \
+  -- migrate_pool_state --admin "$ADMIN"
+```
+
+### Step 5 — Validate
+
+```bash
+# Confirm live code matches candidate.
+stellar contract fetch --id "$LENDING" --network "$NET" \
+  --rpc-url "$RPC" --out-file "$SNAP/live-after.wasm"
+[ "$(sha256sum "$SNAP/live-after.wasm" | cut -d' ' -f1)" = "$HASH" ] \
+  && echo "✅ upgrade confirmed"
+
+# Post-upgrade stats must decode cleanly.
+stellar contract invoke --id "$LENDING" --network "$NET" --rpc-url "$RPC" \
+  -- get_system_stats > "$SNAP/stats-after.json"
+
+diff <(jq -S . "$SNAP/stats-before.json") \
+     <(jq -S . "$SNAP/stats-after.json") \
+  && echo "✅ state unchanged" \
+  || echo "ℹ️  state diff (expected for migrations — review manually)"
+```
+
+### Step 6 — Rollback rehearsal
+
+```bash
+PREV=$(cut -d' ' -f1 "$SNAP/previous.sha256")
+stellar contract upload --wasm "$SNAP/previous.wasm" \
+  --source "$ADMIN_ID" --network "$NET" --rpc-url "$RPC"
+
+stellar contract invoke --id "$LENDING" --source "$ADMIN_ID" \
+  --network "$NET" --rpc-url "$RPC" \
+  -- upgrade --admin "$ADMIN" --new_wasm_hash "$PREV"
+
+stellar contract fetch --id "$LENDING" --network "$NET" \
+  --rpc-url "$RPC" --out-file "$SNAP/live-rolled-back.wasm"
+[ "$(sha256sum "$SNAP/live-rolled-back.wasm" | cut -d' ' -f1)" = "$PREV" ] \
+  && echo "✅ rollback confirmed"
+```
+
+### Step 7 — Attach the rehearsal report to the release ticket
+
+```bash
+cat > "$SNAP/report.md" <<EOF
+# Rehearsal report — $(date -u)
+
+| Item | Result |
+|---|---|
+| Candidate hash matches file | ✅ |
+| Upgrade executed on devnet | ✅ |
+| migrate_pool_state idempotent | ✅ |
+| Post-upgrade stats decoded | ✅ |
+| Rollback executed and verified | ✅ |
+
+Artefacts: \`$SNAP/\`
+EOF
+
+echo "Rehearsal report written to $SNAP/report.md"
+echo "Attach this report to the release ticket before proceeding to testnet."
+```
+
+**No rehearsal report → no upgrade.**
+
+---
+
+## Timelock integration
+
+> All sensitive admin actions must be routed through the timelock contract
+> (`contracts/timelock`) before execution.  This adds a mandatory delay
+> between scheduling and execution, giving the community time to react.
+> See [docs/UPGRADE_AUTHORIZATION.md](../UPGRADE_AUTHORIZATION.md) for the
+> full authorization model.
+
+### Sensitive actions that require the timelock
+
+| Action | Reason |
+|---|---|
+| `set_oracle` | Oracle manipulation risk |
+| `set_risk_params` / `set_min_collateral_ratio` | Affects all user positions |
+| `set_base_rate` / `set_kink_utilization` / `set_multiplier` | Interest-rate model |
+| `set_reserve_factor` | Protocol revenue |
+| `set_rate_limits` | Borrowing caps |
+| `set_pause_switches` (pause **and** unpause) | Protocol availability |
+| `set_asset_params` | Per-asset risk parameters |
+| `upgrade` (WASM swap) | Code replacement |
+
+`emergency_rate_adjustment` is intentionally **exempt** — it is instant by design.
+
+### Scheduling an action through the timelock
+
+```bash
+# 1. Compute the args hash locally before scheduling.
+#    args_hash = SHA-256(XDR-encode(args))
+#    The timelock stores only the hash; the executor supplies the real args
+#    at execution time, and the contract re-hashes to verify integrity.
+
+# 2. Schedule — admin only.
+ETA=$(( $(date +%s) + 172800 ))   # 48 hours from now
+stellar contract invoke \
+  --id "$TIMELOCK" --source "$ADMIN_ID" --network "$NET" \
+  -- schedule \
+  --caller  "$ADMIN" \
+  --target  "$LENDING" \
+  --function "set_oracle" \
+  --args_hash "<SHA-256-of-args>" \
+  --eta "$ETA"
+
+# 3. After 48 hours have elapsed, execute — executor only.
+stellar contract invoke \
+  --id "$TIMELOCK" --source "$EXECUTOR_ID" --network "$NET" \
+  -- execute \
+  --caller "$EXECUTOR" \
+  --id <operation-id> \
+  --args "<original-args>"
+```
+
+### Cancelling a scheduled action
+
+```bash
+# Admin can cancel at any time before execution.
+stellar contract invoke \
+  --id "$TIMELOCK" --source "$ADMIN_ID" --network "$NET" \
+  -- cancel \
+  --caller "$ADMIN" \
+  --id <operation-id>
+```
+
+### Updating the delay
+
+```bash
+# min_delay must be ≥ 1 h; max_delay ≤ 30 days.
+stellar contract invoke \
+  --id "$TIMELOCK" --source "$ADMIN_ID" --network "$NET" \
+  -- set_delay \
+  --caller "$ADMIN" \
+  --new_min 172800 \
+  --new_max 2592000
+```

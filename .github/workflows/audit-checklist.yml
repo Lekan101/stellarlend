@@ -1,0 +1,61 @@
+name: Security Audit Checklist
+
+# Closes #1388
+# Runs the automated audit checklist on every push to main/master and on
+# pull requests.  Also available as a manually triggered workflow so
+# maintainers can run it against any branch at any time.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Stellar network to target (testnet | mainnet)"
+        required: false
+        default: testnet
+
+jobs:
+  audit-checklist:
+    name: Audit Checklist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Make checklist script executable
+        run: chmod +x scripts/security/audit-checklist.sh
+
+      - name: Run audit checklist
+        env:
+          AUDIT_REPORT_PATH: audit-report.json
+          STELLAR_NETWORK:   ${{ github.event.inputs.network || 'testnet' }}
+          SKIP_CARGO_AUDIT:  "1"   # cargo-audit needs network; skip in CI sandbox
+        run: ./scripts/security/audit-checklist.sh
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ github.run_number }}
+          path: audit-report.json
+          retention-days: 90
